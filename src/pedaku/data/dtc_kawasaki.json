@@ -1,0 +1,11 @@
+{
+  "P1500": "Kawasaki: Speed Sensor Open Circuit",
+  "P1610": "Kawasaki: ECU Internal Failure",
+  "P1611": "Kawasaki: Sub-Throttle Sensor 1",
+  "P1612": "Kawasaki: Sub-Throttle Sensor 2",
+  "P1613": "Kawasaki: Sub-Throttle Actuator Drive",
+  "P1700": "Kawasaki: Gear Position Sensor",
+  "P1750": "Kawasaki: Fuel Pump Relay Open / Short",
+  "P1760": "Kawasaki: Cooling Fan Relay Circuit",
+  "P1810": "Kawasaki: Sidestand Switch Circuit"
+}

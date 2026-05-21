@@ -1,0 +1,12 @@
+{
+  "P1500": "Yamaha: Speed Sensor Open / Short",
+  "P1601": "Yamaha: ECU Internal Memory Fault",
+  "P1602": "Yamaha: Power Supply ECU Low",
+  "P1603": "Yamaha: Bank Angle Sensor Open / Short",
+  "P1604": "Yamaha: Lean Angle Sensor Voltage Out of Range",
+  "P1610": "Yamaha: Sub-Throttle Position Sensor (YCC-T)",
+  "P1611": "Yamaha: Sub-Throttle Servo Motor",
+  "P1620": "Yamaha: ISC Stepper Motor Open / Short",
+  "P1700": "Yamaha: Side Stand Switch / Neutral Switch",
+  "P1750": "Yamaha: Fuel Pump Relay Drive Open"
+}

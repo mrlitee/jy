@@ -1,0 +1,17 @@
+{
+  "P1107": "MAP Sensor Circuit Low (Honda PGM-FI)",
+  "P1108": "MAP Sensor Circuit High (Honda PGM-FI)",
+  "P1121": "Throttle Position Lower Than Expected",
+  "P1122": "Throttle Position Higher Than Expected",
+  "P1128": "MAP Lower Than Expected",
+  "P1129": "MAP Higher Than Expected",
+  "P1166": "O2 Sensor Heater System Malfunction",
+  "P1297": "Electrical Load Detector Circuit Low",
+  "P1361": "Top Dead Center Sensor Intermittent Interruption",
+  "P1362": "Top Dead Center Sensor No Signal",
+  "P1457": "EVAP Canister Vent Shut Valve",
+  "P1635": "ABS-ECU Communication Lost",
+  "P0627": "Fuel Pump Relay Control Circuit Open",
+  "P1683": "Bank Angle Sensor (BAS) Circuit Low",
+  "P1684": "Bank Angle Sensor (BAS) Circuit High"
+}

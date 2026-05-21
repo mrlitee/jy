@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Pedaku — Motorcycle Diagnostic</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Pedaku <span class="sub">Motorcycle Diagnostic — ELM327</span></h1>
+    <div class="header-right">
+      <span class="health-pill">
+        Health <span id="health-score" class="hi">—</span>
+      </span>
+      <span class="stream-pill" title="Live stream">
+        <span id="stream-dot" class="stream-dot off"></span>stream
+      </span>
+      <div id="status" class="status offline">offline</div>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="connect">Connect</button>
+    <button class="tab" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="live">Live Chart</button>
+    <button class="tab" data-tab="dyno">Dyno</button>
+    <button class="tab" data-tab="dtc">DTC</button>
+    <button class="tab" data-tab="tests">Live Test</button>
+    <button class="tab" data-tab="raw">Raw</button>
+    <button class="tab" data-tab="help">Help</button>
+  </nav>
+
+  <main>
+    <!-- ===== CONNECT ===== -->
+    <section id="tab-connect" class="panel active">
+      <h2>Connect to ELM327</h2>
+      <form id="connect-form">
+        <label>Adapter type
+          <select name="kind" id="f-kind">
+            <option value="tcp">TCP / WiFi (or BT-bridge)</option>
+            <option value="bluetooth">Bluetooth (native, RFCOMM/SPP)</option>
+            <option value="serial">Serial / USB / rfcomm</option>
+          </select>
+        </label>
+        <label>Address
+          <input name="address" id="f-address" placeholder="e.g. 192.168.0.10:35000  or  /dev/rfcomm0" value="192.168.0.10:35000" />
+        </label>
+        <div id="bt-controls" class="bt-controls" hidden>
+          <button type="button" id="btn-bt-scan">Scan paired devices</button>
+          <select id="f-bt-devices" hidden></select>
+          <span id="bt-hint" class="hint"></span>
+        </div>
+        <label>Motorcycle brand
+          <select name="brand" id="f-brand"></select>
+        </label>
+        <div class="actions">
+          <button type="submit" class="primary">Connect</button>
+          <button type="button" id="btn-disconnect">Disconnect</button>
+        </div>
+      </form>
+
+      <div class="card" id="info-card" hidden>
+        <h3>ECU Info</h3>
+        <table id="info-table"></table>
+      </div>
+    </section>
+
+    <!-- ===== DASHBOARD ===== -->
+    <section id="tab-dashboard" class="panel">
+      <div class="row-between">
+        <h2>Live Data</h2>
+        <span class="hint">Streaming real-time via SSE — tidak ada polling delay.</span>
+      </div>
+      <div id="gauges" class="gauges"></div>
+    </section>
+
+    <!-- ===== LIVE CHART ===== -->
+    <section id="tab-live" class="panel">
+      <div class="row-between">
+        <h2>Live Chart</h2>
+        <div id="chart-window" class="window-buttons">
+          <button data-ms="15000">15s</button>
+          <button data-ms="60000" class="active">60s</button>
+          <button data-ms="180000">3m</button>
+          <button data-ms="600000">10m</button>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="main-chart"></canvas>
+      </div>
+      <div class="chart-legend" id="chart-series"></div>
+      <p class="hint">
+        Setiap series dinormalisasi ke rentangnya sendiri (0–100% kiri) sehingga
+        RPM, suhu, dan tekanan bisa di-overlay tanpa salah satu menutupi yang
+        lain. Hover untuk melihat nilai aktual.
+      </p>
+    </section>
+
+    <!-- ===== DYNO ===== -->
+    <section id="tab-dyno" class="panel">
+      <div class="row-between">
+        <h2>Dyno</h2>
+        <span class="hint">Estimasi HP/Torsi engine dari MAP × Load × RPM (bukan dyno chassis sebenarnya).</span>
+      </div>
+
+      <div class="dyno-controls">
+        <label class="dyno-field">
+          <span>Displacement (cc)</span>
+          <input id="dyno-displacement" type="number" min="50" max="2000" step="1" value="150" />
+        </label>
+        <label class="dyno-field">
+          <span>Peak torque ref (Nm)</span>
+          <input id="dyno-peak-torque" type="number" min="5" max="300" step="1" value="14" />
+        </label>
+        <label class="dyno-field">
+          <span>RPM redline</span>
+          <input id="dyno-rpm-max" type="number" min="3000" max="20000" step="500" value="11000" />
+        </label>
+        <label class="dyno-field">
+          <span>Drivetrain loss (%)</span>
+          <input id="dyno-loss" type="number" min="0" max="40" step="1" value="10" />
+        </label>
+        <div class="dyno-actions">
+          <button id="btn-dyno-record" class="primary">Start Run</button>
+          <button id="btn-dyno-hold">Hold Run</button>
+          <button id="btn-dyno-reset" class="danger">Reset</button>
+        </div>
+      </div>
+
+      <div class="dyno-readout">
+        <div class="dyno-stat" data-color="rpm">
+          <div class="lbl">RPM</div>
+          <div class="val" id="dyno-live-rpm">—</div>
+        </div>
+        <div class="dyno-stat" data-color="hp">
+          <div class="lbl">Power (HP)</div>
+          <div class="val" id="dyno-live-hp">—</div>
+        </div>
+        <div class="dyno-stat" data-color="torque">
+          <div class="lbl">Torque (Nm)</div>
+          <div class="val" id="dyno-live-torque">—</div>
+        </div>
+        <div class="dyno-stat" data-color="hp">
+          <div class="lbl">Peak HP</div>
+          <div class="val" id="dyno-peak-hp">—</div>
+          <div class="sub" id="dyno-peak-hp-rpm"></div>
+        </div>
+        <div class="dyno-stat" data-color="torque">
+          <div class="lbl">Peak Torque</div>
+          <div class="val" id="dyno-peak-tq">—</div>
+          <div class="sub" id="dyno-peak-tq-rpm"></div>
+        </div>
+        <div class="dyno-stat" data-color="rpm">
+          <div class="lbl">Run #</div>
+          <div class="val" id="dyno-run-num">1</div>
+          <div class="sub" id="dyno-status">recording</div>
+        </div>
+      </div>
+
+      <div class="chart-wrap dyno-chart-wrap">
+        <canvas id="dyno-chart"></canvas>
+      </div>
+
+      <p class="hint">
+        Cara baca: tarik gas full-throttle dari ~3000 RPM ke redline. Setiap RPM-bin
+        menyimpan nilai puncak — sapuan berulang akan membentuk envelope <i>max-effort</i>
+        seperti dyno asli. Klik <b>Hold Run</b> untuk membekukan run lalu mulai run baru.
+        Estimasi torsi: <code>τ ≈ τ_ref × (MAP·load%)/maxObserved</code>; HP ≈ <code>τ × ω</code>.
+      </p>
+    </section>
+
+    <!-- ===== DTC ===== -->
+    <section id="tab-dtc" class="panel">
+      <h2>Diagnostic Trouble Codes</h2>
+      <div class="actions">
+        <button id="btn-dtc-read" class="primary">Read DTCs</button>
+        <button id="btn-dtc-clear" class="danger">Clear DTCs</button>
+        <button id="btn-freeze">Freeze Frame</button>
+        <button id="btn-report">Download PDF Report</button>
+      </div>
+      <table class="data-table" id="dtc-table">
+        <thead><tr><th>Code</th><th>Severity</th><th>Brand</th><th>Description</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p id="dtc-empty" class="hint" hidden>Tidak ada DTC tersimpan.</p>
+
+      <h3>Freeze Frame (Mode 02)</h3>
+      <pre id="freeze-out" class="raw-output">Klik <b>Freeze Frame</b> untuk membaca snapshot saat DTC pertama tersimpan.</pre>
+    </section>
+
+    <!-- ===== LIVE TEST ===== -->
+    <section id="tab-tests" class="panel">
+      <h2>Active / Actuator Tests</h2>
+      <p class="warn">⚠️ Beberapa test mengaktifkan aktuator. Pastikan motor diam, dudukan stabil, jauh dari bensin tumpah.</p>
+      <div id="tests-list" class="tests"></div>
+    </section>
+
+    <!-- ===== RAW ===== -->
+    <section id="tab-raw" class="panel">
+      <h2>Raw Command</h2>
+      <p class="hint">Kirim perintah AT atau OBD-II mentah (mis. <code>ATRV</code>, <code>0100</code>, <code>22F190</code>). Output terbaru muncul di atas.</p>
+      <form id="raw-form">
+        <input id="raw-cmd" placeholder="ATRV" autocomplete="off" />
+        <button type="submit" class="primary">Send</button>
+      </form>
+      <pre id="raw-out" class="raw-output"></pre>
+    </section>
+
+    <!-- ===== HELP ===== -->
+    <section id="tab-help" class="panel">
+      <h2>Setup ELM327</h2>
+      <ol>
+        <li><b>WiFi adapter</b>: HP join WiFi <code>WiFi_OBDII</code> → address <code>192.168.0.10:35000</code> (TCP)</li>
+        <li><b>Bluetooth native (Linux / Termux rooted)</b>:
+          <ol type="a">
+            <li>Pair ELM327 sekali lewat <code>bluetoothctl</code> (PIN <code>1234</code>/<code>0000</code>)</li>
+            <li>Kind = <b>Bluetooth</b>, klik <b>Scan paired devices</b> → pilih dropdown, atau ketik MAC manual</li>
+            <li>RFCOMM channel default = 1. Override dengan <code>AA:BB:CC:DD:EE:FF@2</code></li>
+          </ol>
+        </li>
+        <li><b>Bluetooth via bridge app (Termux non-root)</b>:
+          <ol type="a">
+            <li>Pair ELM327 di Settings Android (PIN <code>1234</code>/<code>0000</code>)</li>
+            <li>Install bridge app ("Bluetooth TCP bridge"), mode TCP server port <code>35000</code></li>
+            <li>Kind = <b>TCP</b>, address <code>127.0.0.1:35000</code></li>
+          </ol>
+        </li>
+        <li><b>USB OTG / rfcomm bind</b>: kind <b>Serial</b>, address <code>/dev/ttyUSB0</code> atau <code>/dev/rfcomm0</code></li>
+      </ol>
+
+      <h3>Real-time architecture</h3>
+      <ul>
+        <li>Backend menjalankan satu I/O worker thread per session — semua perintah ECU diserialisasi di sana.</li>
+        <li>Sampler latar terus membaca PID dengan jadwal adaptif: RPM/TPS @ 10 Hz, suhu/baro @ 0.2–1 Hz.</li>
+        <li>Browser berlangganan via Server-Sent Events di <code>/api/stream</code> — tidak ada polling.</li>
+        <li>Klik DTC scan / actuator test akan mendahului sampling (priority queue), sehingga respons terasa instan.</li>
+      </ul>
+
+      <h3>Tips</h3>
+      <ul>
+        <li>Kunci kontak motor harus <b>ON</b>, tegangan aki <b>≥ 11V</b></li>
+        <li>Beberapa ELM327 clone bermasalah pada protokol KWP. Kalau gagal, coba brand <b>Generic OBD-II</b></li>
+        <li>Halaman bisa diakses dari HP lain di WiFi yang sama: <code>http://&lt;ip-termux&gt;:5000</code></li>
+      </ul>
+    </section>
+  </main>
+
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

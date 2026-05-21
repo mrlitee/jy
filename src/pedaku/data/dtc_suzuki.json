@@ -1,0 +1,12 @@
+{
+  "P1500": "Suzuki: Tip-Over (Bank Angle) Sensor Circuit",
+  "P1651": "Suzuki: PAIR Control Solenoid Valve Open / Short",
+  "P1652": "Suzuki: STV Actuator Open / Short",
+  "P1653": "Suzuki: STV Servo Motor Position Sensor",
+  "P1654": "Suzuki: Exhaust Valve Servo (SET-V)",
+  "P1655": "Suzuki: Steering Damper Solenoid Open / Short",
+  "P1656": "Suzuki: HO2S Heater Bank 2 Sensor 1",
+  "P1657": "Suzuki: ISC Stepper Motor Drive Circuit",
+  "P1700": "Suzuki: Gear Position Switch Signal Out of Range",
+  "P1850": "Suzuki: Clutch Position Switch (SCAS) Fault"
+}
