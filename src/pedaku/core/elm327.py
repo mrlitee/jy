@@ -1,4 +1,23 @@
-"""ELM327 AT-command driver. Handles init, protocol negotiation, and request/response."""
+"""ELM327 AT-command driver. Handles init, protocol negotiation, and request/response.
+
+Robustness contract
+-------------------
+Every command goes through :meth:`_command`, which:
+
+1. Drains any leftover bytes on the transport before writing (so a stray
+   prompt from a previous cancelled command doesn't make the next reply
+   look corrupt).
+2. Catches :class:`TransportError` from the underlying socket / serial,
+   tries one full reopen + retry, and only then surfaces the failure.
+3. Returns a :class:`ElmResponse` whose ``ok`` flag tells callers whether
+   the ECU answered with usable data, while leaving the *transport* alive
+   for the next command. NO DATA / BUS BUSY / "?" do NOT count as
+   transport failures - those are normal ECU responses.
+
+Exposes a ``failure_streak`` counter the LiveSampler uses for its
+watchdog: too many consecutive transport-level failures flip the session
+to disconnected so the UI gets a clean signal.
+"""
 from __future__ import annotations
 
 import logging
@@ -7,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .transport import Transport
+from .transport import Transport, TransportError
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +55,10 @@ class Elm327:
     """High-level ELM327 driver. Sends AT/OBD commands and decodes responses."""
 
     PROMPT = b">"
+    # How many consecutive transport-level failures we let the LiveSampler
+    # watchdog see before it tears down the session. The driver itself only
+    # retries once per command; this counter is read externally.
+    failure_streak: int = 0
 
     def __init__(self, transport: Transport):
         self.transport = transport
@@ -44,15 +67,58 @@ class Elm327:
 
     # ---------------- low-level ----------------
     def _command(self, cmd: str, timeout: float = 2.0) -> ElmResponse:
-        if not self.transport.is_open:
-            self.transport.open()
-        log.debug(">> %s", cmd)
-        self.transport.write((cmd + "\r").encode("ascii"))
-        raw = self.transport.read_until(self.PROMPT, timeout=timeout)
-        text = raw.decode("ascii", errors="ignore").replace("\r", "\n")
-        text = text.replace(">", "").strip()
-        log.debug("<< %s", text)
-        return self._parse(text)
+        """Send a command, wait for the next ELM327 prompt, parse the reply.
+
+        On a transport-level failure (socket reset, serial gone) we close
+        the transport, reopen it, and try ONE more time. A second failure
+        is surfaced as a non-OK :class:`ElmResponse` so HTTP handlers can
+        report a clean error instead of bubbling an OSError up the stack.
+        """
+        for attempt in range(2):
+            if not self.transport.is_open:
+                try:
+                    self.transport.open()
+                except TransportError as ex:
+                    self.failure_streak += 1
+                    if attempt == 1:
+                        return ElmResponse(raw="", frames=[], ok=False,
+                                            error=f"transport reopen failed: {ex}")
+                    continue
+            try:
+                # Drain any stale prompt bytes so the next read can't latch
+                # onto a previous-command terminator and return early.
+                self.transport.drain()
+                log.debug(">> %s", cmd)
+                self.transport.write((cmd + "\r").encode("ascii"))
+                raw = self.transport.read_until(self.PROMPT, timeout=timeout)
+            except TransportError as ex:
+                log.warning("transport error on %r (attempt %d): %s",
+                            cmd, attempt + 1, ex)
+                self.failure_streak += 1
+                # Try once more after a forced reopen; a flaky WiFi link or
+                # a powered-down adapter sometimes recovers within a second.
+                try:
+                    self.transport.reopen()
+                except TransportError as reopen_ex:
+                    if attempt == 1:
+                        return ElmResponse(raw="", frames=[], ok=False,
+                                            error=f"transport dead: {reopen_ex}")
+                    continue
+                if attempt == 1:
+                    return ElmResponse(raw="", frames=[], ok=False,
+                                        error=f"transport error: {ex}")
+                continue
+            text = raw.decode("ascii", errors="ignore").replace("\r", "\n")
+            text = text.replace(">", "").strip()
+            log.debug("<< %s", text)
+            response = self._parse(text)
+            # ECU said NO DATA / "?" -> link is fine, command just didn't
+            # apply. Reset the streak so a single missing PID doesn't trip
+            # the session watchdog.
+            self.failure_streak = 0
+            return response
+        # Unreachable but keeps mypy happy.
+        return ElmResponse(raw="", frames=[], ok=False, error="unreachable")
 
     @staticmethod
     def _parse(text: str) -> ElmResponse:
@@ -121,6 +187,27 @@ class Elm327:
         return ElmResponse(raw=text, frames=frames, ok=True)
 
     # ---------------- init ----------------
+    def _wait_prompt(self, timeout: float = 4.0) -> bool:
+        """After ``ATZ`` the adapter prints a banner, then a ``>``. Older
+        clones can take 1.5+ seconds to do that and a fixed sleep was the
+        old root cause of "ELM327 init failed (no protocol detected)" on
+        slow adapters: we'd send ``ATE0`` while ``ATZ``'s banner was still
+        in flight, the adapter would echo our command back into the banner,
+        and every subsequent reply was misaligned.
+        """
+        if not self.transport.is_open:
+            try:
+                self.transport.open()
+            except TransportError as ex:
+                log.warning("transport open in _wait_prompt failed: %s", ex)
+                return False
+        try:
+            data = self.transport.read_until(self.PROMPT, timeout=timeout)
+        except TransportError as ex:
+            log.warning("waiting for prompt failed: %s", ex)
+            return False
+        return self.PROMPT in data
+
     def initialize(self, protocol: str = "0") -> bool:
         """Bring the adapter into a known state and auto-detect the protocol.
 
@@ -131,7 +218,10 @@ class Elm327:
         """
         # reset
         self._command("ATZ", timeout=4.0)
-        time.sleep(0.4)
+        # Wait for the post-banner prompt instead of sleeping a fixed 0.4s.
+        # Cheap clones routinely take 1-2s to print their boot banner; we
+        # used to clobber that banner with the next command.
+        self._wait_prompt(timeout=2.0)
         # echo off, linefeeds off, spaces off, headers off, adaptive timing aggressive
         for cmd in ("ATE0", "ATL0", "ATS0", "ATH0", "ATAT2", "ATST64"):
             r = self._command(cmd)
@@ -141,8 +231,10 @@ class Elm327:
         r = self._command(f"ATSP{protocol}")
         if not r.ok:
             return False
-        # warm-up: send 0100 to force protocol detection
-        r = self._command("0100", timeout=5.0)
+        # warm-up: send 0100 to force protocol detection. Some adapters
+        # answer "SEARCHING..." for a couple of seconds before the first
+        # real reply, so allow a longer timeout here.
+        r = self._command("0100", timeout=6.0)
         if not r.ok:
             log.warning("0100 failed during init: %s", r.error)
         # query active protocol
@@ -177,4 +269,7 @@ class Elm327:
             self._command("ATPC")  # protocol close
         except Exception:
             pass
-        self.transport.close()
+        try:
+            self.transport.close()
+        except Exception as ex:  # pragma: no cover - defensive
+            log.debug("transport close error: %s", ex)

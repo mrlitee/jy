@@ -21,6 +21,15 @@ This module replaces that with a single dedicated I/O worker per session:
 The result is "no-delay" UX: the dashboard updates as soon as a sample is
 taken, and clicking "Read DTCs" pre-empts the next sample so it returns
 within one ECU round-trip (~150 ms typical).
+
+Resilience
+----------
+The sampler is also where we detect a *dead* link instead of just a slow
+one. Every sample is graded "ok" (we got numeric data) or "fail" (the
+transport raised, or every recent sample returned ``None``). Once
+``_consec_fail`` exceeds :attr:`DEAD_AFTER_FAILURES` we fire
+``on_link_dead`` so the owning :class:`DiagnosticSession` can mark itself
+disconnected and the SSE handlers can exit cleanly.
 """
 from __future__ import annotations
 
@@ -96,8 +105,21 @@ class LiveSampler:
     """
 
     HISTORY_LEN = 600  # ~5 minutes at 2 Hz, ~1 minute at 10 Hz - per PID
+    # Watchdog: number of consecutive sample failures before we declare the
+    # link dead. With 10 Hz fastest PID and 1Hz slowest, 25 failures is a
+    # ~5-second window - long enough to ride out a single bad WiFi packet
+    # but short enough to flip the UI offline before the user notices.
+    DEAD_AFTER_FAILURES = 25
 
-    def __init__(self, *, request_fn: Callable[[str, float], Any], pids: Iterable[Pid]):
+    def __init__(
+        self,
+        *,
+        request_fn: Callable[[str, float], Any],
+        pids: Iterable[Pid],
+        on_link_dead: Optional[Callable[[str], None]] = None,
+        heartbeat_fn: Optional[Callable[[], bool]] = None,
+        heartbeat_interval: float = 30.0,
+    ):
         self._request_fn = request_fn
         self._pids: list[Pid] = list(pids)
         # Default period per PID (seconds). ``_period`` is the ACTIVE schedule
@@ -124,6 +146,18 @@ class LiveSampler:
         self._paused = threading.Event()
         self._thread = threading.Thread(target=self._run, name="elm-io", daemon=True)
         self._started = False
+
+        # Watchdog state -- read by the owning session.
+        self._consec_fail = 0
+        self._link_dead_fired = False
+        self._on_link_dead = on_link_dead
+
+        # Heartbeat: a cheap call (typically ATRV) issued every N seconds
+        # so we notice a half-open link even when the user is parked on a
+        # tab that doesn't actively poll PIDs.
+        self._heartbeat_fn = heartbeat_fn
+        self._heartbeat_interval = float(heartbeat_interval)
+        self._next_heartbeat = time.monotonic() + self._heartbeat_interval
 
     # ---------------- lifecycle ----------------
     def start(self) -> None:
@@ -154,6 +188,9 @@ class LiveSampler:
         if self._thread.is_alive():
             log.warning("LiveSampler worker did not exit within %.1fs; "
                         "the transport will be closed regardless.", timeout)
+        # Wake any blocked submit() callers with a clear error so HTTP
+        # handlers don't hang on a queue that will never drain.
+        self._fail_pending_jobs("session stopped")
 
     def pause_sampling(self) -> None:
         """Stop background PID sampling without killing the worker."""
@@ -161,6 +198,10 @@ class LiveSampler:
 
     def resume_sampling(self) -> None:
         self._paused.clear()
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consec_fail
 
     def set_focus(self, codes: Iterable[str], period_s: float) -> None:
         """Temporarily boost the sampling rate of the given PIDs.
@@ -246,7 +287,18 @@ class LiveSampler:
             except queue.Empty:
                 pass
 
-            # 2. If sampling is paused or empty, wait on the job queue.
+            # 2. Heartbeat probe whenever it's due. Safe to skip if the link
+            #    has just been declared dead - we don't want to pile failures
+            #    on a session that's about to be torn down.
+            if (
+                self._heartbeat_fn is not None
+                and not self._link_dead_fired
+                and time.monotonic() >= self._next_heartbeat
+            ):
+                self._do_heartbeat()
+                self._next_heartbeat = time.monotonic() + self._heartbeat_interval
+
+            # 3. If sampling is paused or empty, wait on the job queue.
             if self._paused.is_set() or not self._heap:
                 try:
                     job = self._jobs.get(timeout=0.1)
@@ -255,7 +307,7 @@ class LiveSampler:
                     pass
                 continue
 
-            # 3. Otherwise, look at the next-due PID. If not yet due, sleep on
+            # 4. Otherwise, look at the next-due PID. If not yet due, sleep on
             #    the job queue so a user command can pre-empt us.
             next_due, _, pid = self._heap[0]
             now = time.monotonic()
@@ -286,12 +338,18 @@ class LiveSampler:
             job.done.set()
 
     def _sample_pid(self, pid: Pid) -> None:
+        ok = False
         try:
             r = self._request_fn(pid.request, 1.0)
             value = parse_response(pid, r.frames) if r.ok else None
+            ok = bool(r.ok)
         except Exception as ex:
             log.debug("sample %s failed: %s", pid.code, ex)
             value = None
+        self._record_sample(pid, value)
+        self._update_health(ok and value is not None)
+
+    def _record_sample(self, pid: Pid, value: Optional[float | str]) -> None:
         ts = time.time()
         sample = Sample(code=pid.code, name=pid.name, unit=pid.unit, value=value, ts=ts)
         with self._lock:
@@ -310,6 +368,52 @@ class LiveSampler:
                         dead.append(q)
             for q in dead:
                 self._subs.discard(q)
+
+    def _update_health(self, ok: bool) -> None:
+        if ok:
+            self._consec_fail = 0
+            return
+        self._consec_fail += 1
+        if (
+            not self._link_dead_fired
+            and self._consec_fail >= self.DEAD_AFTER_FAILURES
+            and self._on_link_dead is not None
+        ):
+            self._link_dead_fired = True
+            log.warning("link declared dead after %d consecutive failures",
+                        self._consec_fail)
+            try:
+                self._on_link_dead(
+                    f"no usable ECU response in last {self._consec_fail} samples",
+                )
+            except Exception as ex:  # pragma: no cover - defensive
+                log.error("on_link_dead callback raised: %s", ex)
+            # Stop sampling so we don't spin on a dead transport. The
+            # session will call stop() shortly, but pausing first keeps the
+            # log quiet during the teardown window.
+            self.pause_sampling()
+
+    def _do_heartbeat(self) -> None:
+        try:
+            ok = bool(self._heartbeat_fn())  # type: ignore[misc]
+        except Exception as ex:
+            log.debug("heartbeat raised: %s", ex)
+            ok = False
+        # A heartbeat counts toward the watchdog the same way a sample does:
+        # a thread-safe check that the underlying transport actually moves
+        # bytes. Crucially this also means the link is detected dead even if
+        # the user only sits on tabs that never poll PIDs.
+        self._update_health(ok)
+
+    def _fail_pending_jobs(self, reason: str) -> None:
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                return
+            if not job.done.is_set():
+                job.result["error"] = reason
+                job.done.set()
 
 
 def compute_health_score(latest: dict[str, dict[str, Any]], dtc_count: int) -> int:

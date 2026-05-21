@@ -6,11 +6,25 @@ A session owns:
 * one :class:`Elm327` driver wrapping it,
 * one :class:`LiveSampler` that runs the dedicated I/O thread - all ECU
   commands route through this thread to keep the UI responsive.
+
+Lifecycle
+---------
+``connect()`` is idempotent and self-healing: if the transport fails on the
+first attempt we close everything and retry up to :attr:`CONNECT_RETRIES`
+times before giving up. The ``last_error`` field carries the human-readable
+reason of the most recent failure so the UI can show it instead of a flat
+"Connect failed".
+
+While connected, the :class:`LiveSampler` calls :meth:`_on_link_dead` when
+its watchdog has seen too many consecutive transport failures; the session
+flips ``connected`` to ``False`` so the SSE handlers exit cleanly and the
+browser shows an "offline" indicator without the user clicking anything.
 """
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -25,6 +39,7 @@ from .transport import (
     SerialTransport,
     TcpTransport,
     Transport,
+    TransportError,
 )
 
 log = logging.getLogger(__name__)
@@ -54,15 +69,28 @@ class DiagnosticSession:
     db: DtcDatabase = field(default_factory=DtcDatabase)
     info: EcuInfo = field(default_factory=EcuInfo)
     live: LiveSampler = field(init=False)
+    last_error: str = ""
     _connected: bool = field(default=False, init=False, repr=False)
     _connect_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _last_dtc_count: int = field(default=0, init=False, repr=False)
+
+    # Try the entire ATZ / ATSP / 0100 init sequence this many times before
+    # giving up. Cheap clones occasionally need a kick before they answer.
+    CONNECT_RETRIES: int = 2
 
     def __post_init__(self) -> None:
         self.elm = Elm327(self.transport)
         self.runner = LiveTestRunner(self.elm)
         # Sampler is set up lazily during connect() once we know the active PIDs.
-        self.live = LiveSampler(request_fn=self.elm.request, pids=all_live_pids())
+        # We pass a heartbeat that pings ATRV (always supported) so a dead link
+        # is detected even when the user is parked on a non-PID-polling tab.
+        self.live = LiveSampler(
+            request_fn=self.elm.request,
+            pids=all_live_pids(),
+            on_link_dead=self._on_link_dead,
+            heartbeat_fn=self._heartbeat,
+            heartbeat_interval=30.0,
+        )
 
     # ---------------- lifecycle ----------------
     @classmethod
@@ -82,19 +110,58 @@ class DiagnosticSession:
         return self._connected
 
     def connect(self) -> bool:
+        """Bring the transport up and run protocol negotiation.
+
+        Retries the whole sequence up to :attr:`CONNECT_RETRIES` times so a
+        single dropped frame at boot doesn't force the user to click
+        "Connect" again. ``last_error`` is set to the most recent failure
+        reason so the API can surface it instead of a generic "init failed".
+        """
         with self._connect_lock:
+            if self._connected:
+                return True
             profile: BrandProfile = PROFILES.get(self.brand, PROFILES["Generic OBD-II"])
-            self.transport.open()
-            ok = ProtocolSession(self.elm, profile).apply()
-            if not ok:
-                return False
-            self.info.adapter = self.elm.device_id()
-            self.info.voltage = self.elm.voltage()
-            self.info.protocol = self.elm.protocol or ""
-            self._read_vehicle_info()
-            self._connected = True
-            self.live.start()
-            return True
+            last_err = ""
+            for attempt in range(self.CONNECT_RETRIES + 1):
+                try:
+                    self.transport.open()
+                except TransportError as ex:
+                    last_err = f"transport open failed: {ex}"
+                    log.warning("connect attempt %d/%d: %s",
+                                attempt + 1, self.CONNECT_RETRIES + 1, last_err)
+                    time.sleep(0.5)
+                    continue
+                try:
+                    ok = ProtocolSession(self.elm, profile).apply()
+                except Exception as ex:
+                    last_err = f"protocol negotiation raised: {ex}"
+                    log.exception("connect attempt %d", attempt + 1)
+                    ok = False
+                if not ok:
+                    if not last_err:
+                        last_err = "ELM327 init failed (no protocol detected)"
+                    try:
+                        self.transport.close()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    time.sleep(0.5)
+                    continue
+                # Successful negotiation: gather metadata before exposing
+                # the session as "connected" so /api/state never returns
+                # half-populated info.
+                try:
+                    self.info.adapter = self.elm.device_id()
+                    self.info.voltage = self.elm.voltage()
+                    self.info.protocol = self.elm.protocol or ""
+                    self._read_vehicle_info()
+                except Exception as ex:
+                    log.warning("post-init metadata read failed: %s", ex)
+                self._connected = True
+                self.last_error = ""
+                self.live.start()
+                return True
+            self.last_error = last_err or "ELM327 init failed (unknown reason)"
+            return False
 
     def disconnect(self) -> None:
         with self._connect_lock:
@@ -103,12 +170,41 @@ class DiagnosticSession:
             self._connected = False
             try:
                 self.live.stop()
-            except Exception:
-                pass
+            except Exception as ex:
+                log.debug("live.stop raised: %s", ex)
             try:
                 self.elm.close()
-            except Exception:
-                pass
+            except Exception as ex:
+                log.debug("elm.close raised: %s", ex)
+
+    def _on_link_dead(self, reason: str) -> None:
+        """Watchdog callback: link is considered dead.
+
+        Called from the I/O worker; we cannot block on ``_connect_lock``
+        here (the worker itself might be holding the GIL while another
+        thread calls disconnect()), so we just flip the flag and let the
+        next disconnect / connect cycle do the cleanup.
+        """
+        if not self._connected:
+            return
+        self._connected = False
+        self.last_error = reason
+        log.warning("session marked offline by watchdog: %s", reason)
+
+    def _heartbeat(self) -> bool:
+        """Cheap link-alive probe used by the LiveSampler.
+
+        ATRV is universally supported by every ELM327 / clone and is
+        answered by the *adapter* itself, not the ECU - so it works even
+        when the bike's ignition is off and detects a dead WiFi/BT link
+        regardless of whether the engine is actually running.
+        """
+        try:
+            r = self.elm.request("ATRV", timeout=1.5)
+        except Exception as ex:
+            log.debug("heartbeat raised: %s", ex)
+            return False
+        return bool(r.ok and r.raw)
 
     # ---------------- info ----------------
     def _read_vehicle_info(self) -> None:

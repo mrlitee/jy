@@ -8,6 +8,18 @@ Three transports are supported:
 * :class:`BluetoothTransport` - native Bluetooth Classic RFCOMM (SPP) using
   Python's stdlib ``socket.AF_BLUETOOTH``. Works on Linux / rooted Termux
   with BlueZ. No extra dependency required.
+
+All three implement a uniform :class:`Transport` interface plus a small set
+of "robustness" features that make the link survive flaky WiFi / cheap
+ELM327 clones:
+
+* TCP sockets enable ``SO_KEEPALIVE`` with a ~30s probe schedule so a
+  silently-disconnected adapter is detected long before the kernel's default
+  2-hour timeout.
+* TCP also enables ``TCP_NODELAY`` so the tiny ELM327 prompts aren't held
+  up by Nagle for ~40ms each.
+* Every transport drains pending input on :meth:`reopen` so a stale frame
+  from before a reconnect doesn't pollute the next response.
 """
 from __future__ import annotations
 
@@ -45,8 +57,18 @@ class PortInfo:
     description: str = ""
 
 
+class TransportError(IOError):
+    """Raised when a transport read/write fails because the link is dead.
+
+    Distinct from a transient timeout - the caller (Elm327 driver) treats
+    this as "reopen and retry once" instead of "return NO DATA to user".
+    """
+
+
 class Transport(ABC):
     """Abstract bidirectional byte channel."""
+
+    description: str = ""
 
     @abstractmethod
     def open(self) -> None: ...
@@ -61,6 +83,24 @@ class Transport(ABC):
     @abstractmethod
     def is_open(self) -> bool: ...
 
+    def reopen(self) -> None:
+        """Close + open in one call. Used by the Elm327 driver after a
+        transient transport error to recover without forcing the whole
+        diagnostic session to be torn down by the user."""
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        self.open()
+
+    def drain(self, timeout: float = 0.1) -> None:
+        """Best-effort drain of any pending input bytes.
+
+        Called before every command so a stale ``>`` prompt or partial reply
+        from a previous (cancelled) command does not bleed into the next
+        response. Default is a no-op; transports override.
+        """
+
 
 class SerialTransport(Transport):
     """Serial / USB / pre-bound Bluetooth-SPP transport via pyserial."""
@@ -71,34 +111,58 @@ class SerialTransport(Transport):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self.description = port
         self._ser: Optional["serial.Serial"] = None
 
     def open(self) -> None:
-        self._ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+        try:
+            self._ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+        except Exception as ex:
+            raise TransportError(f"serial open {self.port} failed: {ex}") from ex
 
     def close(self) -> None:
-        if self._ser and self._ser.is_open:
-            self._ser.close()
-        self._ser = None
+        ser, self._ser = self._ser, None
+        if ser is not None:
+            try:
+                if ser.is_open:
+                    ser.close()
+            except Exception as ex:  # pragma: no cover - defensive
+                log.debug("serial close error: %s", ex)
+
+    def drain(self, timeout: float = 0.05) -> None:
+        if self._ser is None or not self._ser.is_open:
+            return
+        try:
+            self._ser.reset_input_buffer()
+        except Exception as ex:
+            log.debug("serial drain error: %s", ex)
 
     def write(self, data: bytes) -> None:
-        assert self._ser is not None, "transport not open"
-        self._ser.reset_input_buffer()
-        self._ser.write(data)
-        self._ser.flush()
+        if self._ser is None or not self._ser.is_open:
+            raise TransportError("serial not open")
+        try:
+            self._ser.reset_input_buffer()
+            self._ser.write(data)
+            self._ser.flush()
+        except Exception as ex:
+            raise TransportError(f"serial write failed: {ex}") from ex
 
     def read_until(self, terminator: bytes = b">", timeout: float = 2.0) -> bytes:
-        assert self._ser is not None, "transport not open"
+        if self._ser is None or not self._ser.is_open:
+            raise TransportError("serial not open")
         end = time.monotonic() + timeout
         buf = bytearray()
-        while time.monotonic() < end:
-            chunk = self._ser.read(64)
-            if chunk:
-                buf.extend(chunk)
-                if terminator in buf:
-                    break
-            else:
-                time.sleep(0.01)
+        try:
+            while time.monotonic() < end:
+                chunk = self._ser.read(64)
+                if chunk:
+                    buf.extend(chunk)
+                    if terminator in buf:
+                        break
+                else:
+                    time.sleep(0.01)
+        except Exception as ex:
+            raise TransportError(f"serial read failed: {ex}") from ex
         return bytes(buf)
 
     @property
@@ -114,31 +178,79 @@ class _SocketTransport(Transport):
         self.timeout: float = 2.0
 
     def close(self) -> None:
-        if self._sock is not None:
+        sock, self._sock = self._sock, None
+        if sock is not None:
             try:
-                self._sock.close()
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
+            except Exception as ex:  # pragma: no cover - defensive
+                log.debug("socket close error: %s", ex)
+
+    def drain(self, timeout: float = 0.05) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.setblocking(False)
+            try:
+                while True:
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        break
+            except (BlockingIOError, OSError):
+                pass
             finally:
-                self._sock = None
+                sock.setblocking(True)
+                sock.settimeout(self.timeout)
+        except Exception as ex:
+            log.debug("socket drain error: %s", ex)
 
     def write(self, data: bytes) -> None:
-        assert self._sock is not None, "transport not open"
-        self._sock.sendall(data)
+        sock = self._sock
+        if sock is None:
+            raise TransportError("socket not open")
+        try:
+            sock.sendall(data)
+        except (OSError, socket.timeout) as ex:
+            raise TransportError(f"socket write failed: {ex}") from ex
 
     def read_until(self, terminator: bytes = b">", timeout: float = 2.0) -> bytes:
-        assert self._sock is not None, "transport not open"
-        self._sock.settimeout(timeout)
+        sock = self._sock
+        if sock is None:
+            raise TransportError("socket not open")
+        # Total deadline-based loop; use a short per-recv timeout so we can
+        # check the deadline frequently and react to the prompt as soon as
+        # it arrives, instead of being blocked on a single long timeout.
+        deadline = time.monotonic() + timeout
         buf = bytearray()
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            try:
-                chunk = self._sock.recv(256)
-            except socket.timeout:
+        peer_closed = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
+            try:
+                sock.settimeout(min(0.5, remaining))
+                chunk = sock.recv(256)
+            except socket.timeout:
+                continue
+            except OSError as ex:
+                # Peer reset / connection aborted -> bubble up so the driver
+                # can reopen the transport instead of returning a corrupt
+                # short read as if it were a normal "NO DATA" reply.
+                if buf:
+                    log.debug("socket read aborted with partial buffer: %s", ex)
+                raise TransportError(f"socket read failed: {ex}") from ex
             if not chunk:
+                # 0-byte recv on a stream socket = peer FINed. Stop reading
+                # and tell the driver the link is dead.
+                peer_closed = True
                 break
             buf.extend(chunk)
             if terminator in buf:
                 break
+        if peer_closed and terminator not in buf:
+            raise TransportError("peer closed connection")
         return bytes(buf)
 
     @property
@@ -146,17 +258,70 @@ class _SocketTransport(Transport):
         return self._sock is not None
 
 
-class TcpTransport(_SocketTransport):
-    """WiFi ELM327 (default 192.168.0.10:35000) or BT-to-TCP bridge."""
+def _enable_tcp_keepalive(sock: socket.socket, idle: int = 30, intvl: int = 10, cnt: int = 3) -> None:
+    """Turn on aggressive TCP keepalive so a dead WiFi ELM327 is detected fast.
 
-    def __init__(self, host: str = "192.168.0.10", port: int = 35000, timeout: float = 2.0):
+    Linux exposes ``TCP_KEEPIDLE/INTVL/CNT``; macOS uses ``TCP_KEEPALIVE``;
+    Windows ignores everything except ``SO_KEEPALIVE``. We try each in turn
+    and silently skip what isn't available - turning ``SO_KEEPALIVE`` on at
+    least gives us OS-default detection (still better than nothing).
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError as ex:  # pragma: no cover - SO_KEEPALIVE always defined
+        log.debug("SO_KEEPALIVE unsupported: %s", ex)
+        return
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", idle),    # Linux
+        ("TCP_KEEPINTVL", intvl),  # Linux
+        ("TCP_KEEPCNT", cnt),      # Linux
+        ("TCP_KEEPALIVE", idle),   # macOS
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError as ex:
+            log.debug("setsockopt %s=%s failed: %s", opt_name, value, ex)
+
+
+class TcpTransport(_SocketTransport):
+    """WiFi ELM327 (default 192.168.0.10:35000) or BT-to-TCP bridge.
+
+    Connect timeout (``connect_timeout``) is separate from the read timeout
+    so a slow DHCP / unreachable adapter doesn't make every subsequent
+    ``recv`` block for the full connect window.
+    """
+
+    def __init__(
+        self,
+        host: str = "192.168.0.10",
+        port: int = 35000,
+        timeout: float = 2.0,
+        connect_timeout: float = 5.0,
+    ):
         super().__init__()
         self.host = host
         self.port = int(port)
         self.timeout = float(timeout)
+        self.connect_timeout = float(connect_timeout)
+        self.description = f"{host}:{port}"
 
     def open(self) -> None:
-        s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        try:
+            s = socket.create_connection(
+                (self.host, self.port), timeout=self.connect_timeout,
+            )
+        except OSError as ex:
+            raise TransportError(
+                f"TCP connect to {self.host}:{self.port} failed: {ex}"
+            ) from ex
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:  # pragma: no cover - rare
+            pass
+        _enable_tcp_keepalive(s)
         s.settimeout(self.timeout)
         self._sock = s
 
@@ -185,6 +350,7 @@ class BluetoothTransport(_SocketTransport):
         self.mac = mac.upper().replace("-", ":")
         self.channel = int(channel)
         self.timeout = float(timeout)
+        self.description = f"{self.mac}@{self.channel}"
 
     @classmethod
     def from_address(cls, address: str, timeout: float = 4.0) -> "BluetoothTransport":
@@ -197,7 +363,7 @@ class BluetoothTransport(_SocketTransport):
         af = getattr(socket, "AF_BLUETOOTH", None)
         proto = getattr(socket, "BTPROTO_RFCOMM", None)
         if af is None or proto is None:
-            raise RuntimeError(
+            raise TransportError(
                 "Native Bluetooth RFCOMM is not available on this Python build. "
                 "It requires Linux/Termux with BlueZ. "
                 "On Termux non-root use the 'TCP via bridge app' option instead."
@@ -208,10 +374,15 @@ class BluetoothTransport(_SocketTransport):
             s.connect((self.mac, self.channel))
         except OSError as ex:
             s.close()
-            raise RuntimeError(
+            raise TransportError(
                 f"Bluetooth connect to {self.mac} ch{self.channel} failed: {ex}. "
                 "Make sure the device is paired, in range, and not bound by another app."
             ) from ex
+        # SO_KEEPALIVE on RFCOMM isn't a portable knob (BlueZ ignores it),
+        # but we still set it so kernels that DO honour it can detect a
+        # frozen adapter without us needing a heartbeat probe.
+        with contextlib.suppress(OSError):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         s.settimeout(self.timeout)
         self._sock = s
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import IO, Iterable, Union
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -16,14 +16,31 @@ from ..core.dtc import Dtc
 from ..core.session import EcuInfo
 
 
+PathOrFile = Union[Path, str, IO[bytes]]
+
+
 def write_report(
-    path: Path,
+    target: PathOrFile,
     info: EcuInfo,
     dtcs: Iterable[Dtc],
     live_snapshot: dict[str, str],
     health_score: int,
-) -> Path:
-    doc = SimpleDocTemplate(str(path), pagesize=A4, title="Diagnosa Report")
+) -> PathOrFile:
+    """Write the diagnostic report.
+
+    *target* can be a filesystem path or an in-memory file (e.g.
+    :class:`io.BytesIO`). Streaming directly into a buffer is what the
+    Flask handler does so it never has to round-trip through ``/tmp`` -
+    that avoids a symlink-attack class of bug on shared hosts.
+    """
+    # SimpleDocTemplate accepts a path or any file-like with .write().
+    # We let reportlab do its own type sniffing so the same call works
+    # for both Path and BytesIO without callers having to care.
+    if isinstance(target, Path):
+        doc_target: Union[str, IO[bytes]] = str(target)
+    else:
+        doc_target = target  # type: ignore[assignment]
+    doc = SimpleDocTemplate(doc_target, pagesize=A4, title="Diagnosa Report")
     styles = getSampleStyleSheet()
     story = []
 
@@ -71,4 +88,4 @@ def write_report(
     story.append(t3)
 
     doc.build(story)
-    return path
+    return target
