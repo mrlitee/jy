@@ -44,7 +44,7 @@ const state = {
   dyno: {
     chart: null,
     recording: false,    // pushes samples to the active run when true
-    runNum: 1,
+    runNum: 0,           // 0 = no user-started run yet (display "—")
     cfg: { displacement: 150, peakTorque: 14, rpmMax: 11000, lossPct: 10 },
     maxEffort: 0.05,     // observed max of (MAP_kPa × load_%/100) — calibrates torque scaling
   },
@@ -136,6 +136,22 @@ function setStatus(connected, info) {
       <tr><td>VIN</td><td>${i.vin || '-'}</td></tr>
       <tr><td>ECU</td><td>${i.ecu_name || '-'}</td></tr>`;
   }
+  // Toggle the "Download PDF Report" button based on whether reportlab
+  // is installed on the server. info.report_available is True/False on
+  // a real connection, and may also come back from /api/state when the
+  // session is offline so the user sees the warning even before connect.
+  applyReportAvailability(info && info.report_available);
+}
+
+function applyReportAvailability(available) {
+  const btn = $('#btn-report');
+  if (!btn) return;
+  // Default to enabled (assume available) when the flag isn't present so we
+  // don't block users on older server builds that don't surface the flag.
+  const ok = (available === undefined) ? true : !!available;
+  btn.disabled = !ok;
+  btn.title = ok ? 'Generate PDF report'
+                 : 'PDF report unavailable: pip install reportlab on the server';
 }
 
 async function refreshHealth() {
@@ -314,8 +330,8 @@ function setupDyno() {
       buildDyno();
       dy.maxEffort = 0.05;       // recalibrate
       dy.recording = false;
-      dy.runNum = 1;
-      $('#dyno-run-num').textContent = dy.runNum;
+      dy.runNum = 0;             // 0 = no user-started run yet
+      $('#dyno-run-num').textContent = '—';
       $('#dyno-status').textContent = 'idle';
       $('#btn-dyno-record').textContent = 'Start Run';
     }));
@@ -324,7 +340,13 @@ function setupDyno() {
     if (!state.connected) return alert('Connect dulu');
     dy.recording = !dy.recording;
     if (dy.recording) {
-      dy.chart.startRun();
+      // The DynoChart constructor seeds an empty run so the chart has
+      // something to draw into before the user records anything. The
+      // FIRST time the user clicks Start Run we reuse that placeholder
+      // (no startRun()), so the run-number on screen tracks the count
+      // of runs the user actually intended to make. Subsequent clicks
+      // call startRun() to begin a fresh envelope.
+      if (dy.runNum > 0) dy.chart.startRun();
       dy.runNum++;
       $('#dyno-run-num').textContent = dy.runNum;
       $('#dyno-status').textContent = 'recording';
@@ -355,8 +377,8 @@ function setupDyno() {
     dy.chart.reset();
     dy.maxEffort = 0.05;
     dy.recording = false;
-    dy.runNum = 1;
-    $('#dyno-run-num').textContent = dy.runNum;
+    dy.runNum = 0;
+    $('#dyno-run-num').textContent = '—';
     $('#dyno-status').textContent = 'idle';
     $('#dyno-peak-hp').textContent = '—';
     $('#dyno-peak-tq').textContent = '—';
@@ -525,7 +547,9 @@ function setupConnect() {
       state.dyno.chart.reset();
       state.dyno.maxEffort = 0.05;
       state.dyno.recording = false;
-      state.dyno.runNum = 1;
+      state.dyno.runNum = 0;
+      $('#dyno-run-num').textContent = '—';
+      $('#dyno-status').textContent = 'idle';
     }
   });
 
@@ -536,9 +560,48 @@ function onConnected() {
   buildGauges();
   if (state.mainChart) state.mainChart.clear();
   openStream();
+  // Seed the live chart and sparklines from the server's ring buffer so
+  // a page reload (or a brief disconnect) doesn't wipe the last few minutes
+  // of recorded history. Fire-and-forget: if it fails we still get future
+  // samples from the SSE stream.
+  seedHistory().catch(() => {});
   refreshHealth();
   if (state.healthTimer) clearInterval(state.healthTimer);
   state.healthTimer = setInterval(refreshHealth, 5000);
+}
+
+async function seedHistory() {
+  if (!state.connected) return;
+  // 600 = full server-side ring buffer (~5 min at 2 Hz).
+  const data = await api('GET', '/api/history?count=600');
+  Object.entries(data).forEach(([code, points]) => {
+    if (!Array.isArray(points) || !points.length) return;
+    const sl = state.sparklines[code];
+    points.forEach(p => {
+      const t = (p.ts || 0) * 1000;
+      const v = p.v;
+      if (state.mainChart && typeof v === 'number') {
+        state.mainChart.push(code, t, v);
+      }
+      if (sl) sl.push(typeof v === 'number' ? v : NaN);
+    });
+    // Refresh the gauge value with the most recent point so the dashboard
+    // shows a non-empty number immediately after reload, even before SSE
+    // delivers the next live sample.
+    const last = points[points.length - 1];
+    if (last && typeof last.v === 'number') {
+      state.lastValues[code] = last.v;
+      const gauge = $(`#g-${code}`);
+      if (gauge) {
+        gauge.classList.remove('stale');
+        gauge.querySelector('.val').textContent = fmtVal(code, last.v);
+      }
+      if (code === '42') {
+        state.lastVoltage = last.v;
+        renderStatus();
+      }
+    }
+  });
 }
 
 // ---------------- DTC ----------------
@@ -682,9 +745,14 @@ async function init() {
 
   try {
     const s = await api('GET', '/api/state');
+    // setStatus also applies report availability; doing it both branches
+    // means the "Download PDF Report" button shows a tooltip warning at
+    // page load even before connect when reportlab is missing.
     if (s.connected) {
       setStatus(true, s);
       onConnected();
+    } else {
+      applyReportAvailability(s && s.report_available);
     }
   } catch (e) { /* ignore */ }
 }

@@ -51,6 +51,23 @@ from .core.transport import discover_bluetooth_devices
 
 log = logging.getLogger(__name__)
 
+
+def _report_available() -> bool:
+    """Return True if the optional ``reportlab`` dependency is importable.
+
+    Surfaced in ``/api/state`` so the UI can disable the "Download PDF Report"
+    button on installs where the user skipped the optional dependency.
+    Re-checked at request time (cheap import-cache lookup) instead of
+    cached, so installing reportlab in a running container is picked up
+    without restarting the server.
+    """
+    try:
+        __import__("reportlab")
+        return True
+    except ImportError:
+        return False
+
+
 # Module-level session. Only the (rare) connect / disconnect operations need
 # this lock - all per-command access is serialized inside the session's own
 # I/O worker thread.
@@ -60,7 +77,7 @@ _session: Optional[DiagnosticSession] = None
 
 def _serialize_info() -> dict[str, Any]:
     if not _session or not _session.connected:
-        return {"connected": False}
+        return {"connected": False, "report_available": _report_available()}
     i = _session.info
     return {
         "connected": True,
@@ -70,6 +87,7 @@ def _serialize_info() -> dict[str, Any]:
         "voltage": i.voltage,
         "protocol": i.protocol,
         "adapter": i.adapter,
+        "report_available": _report_available(),
     }
 
 

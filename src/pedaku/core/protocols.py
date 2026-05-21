@@ -26,8 +26,13 @@ class BrandProfile:
 # points that work on the majority of injection-ECU motorcycles in each family.
 PROFILES: dict[str, BrandProfile] = {
     "Generic OBD-II":  BrandProfile("Generic OBD-II", elm_protocol="0"),
+    # Honda KWP fast init (protocol 5). ATSI is intentionally NOT here -
+    # it requests a SLOW init which is only valid on protocols 3 and 4 and
+    # would make the ELM327 reply with "?" on protocol 5. The remaining
+    # commands set the tester header, the ISO init address, and the wakeup
+    # message that keeps the KWP session alive between requests.
     "Honda":           BrandProfile("Honda", elm_protocol="5",
-                                    init_commands=["ATSH8110F1", "ATIIA10", "ATSI", "ATWM8110F13E"]),
+                                    init_commands=["ATSH8110F1", "ATIIA10", "ATWM8110F13E"]),
     "Yamaha":          BrandProfile("Yamaha", elm_protocol="5",
                                     init_commands=["ATSH8112F1", "ATIIA12"]),
     "Suzuki":          BrandProfile("Suzuki", elm_protocol="5",

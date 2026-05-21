@@ -70,35 +70,54 @@ class Elm327:
         if bad:
             return ElmResponse(raw=text, frames=[], ok=False, error=bad)
 
-        # Long ECU responses come back framed with a ``<idx>:<hex>`` prefix
-        # per line on CAN, and as multiple plain-hex lines on KWP/J1850.
-        # Concatenate any consecutive hex-only lines (CAN-prefixed or not)
-        # into a single decoded byte frame so downstream PID / DTC parsers
-        # see one contiguous payload.
+        # On CAN, long ECU responses (>7 bytes) come back with a per-line
+        # ``<idx>:<hex>`` prefix that ELM327 inserts for each frame of the
+        # multi-frame OBD payload. Such lines must be concatenated into ONE
+        # bytes frame so parse_response sees the contiguous payload.
+        #
+        # Plain hex lines, on the other hand, are independent ECU frames
+        # (typical for J1850 / KWP, single-frame CAN, or the optional 1-byte
+        # length header some clones print before a multi-frame burst).
+        # Each plain hex line therefore becomes its own ``frames[]`` entry
+        # and we flush any in-progress multi-frame run when we see one.
         frames: list[bytes] = []
-        run: list[str] = []
+        multi_run: list[str] = []
 
-        def _flush() -> None:
-            if not run:
+        def _flush_multi() -> None:
+            if not multi_run:
                 return
-            joined = "".join(run).replace(" ", "").replace("\t", "")
-            if joined:
-                try:
-                    frames.append(bytes.fromhex(joined))
-                except ValueError:
-                    pass
-            run.clear()
+            joined = "".join(multi_run).replace(" ", "").replace("\t", "")
+            # Some clones emit an odd nibble count when stripping trailing
+            # padding; pad with a leading zero rather than discarding the
+            # whole frame.
+            if len(joined) % 2 == 1:
+                joined = "0" + joined
+            try:
+                frames.append(bytes.fromhex(joined))
+            except ValueError:
+                pass
+            multi_run.clear()
 
         for ln in lines:
-            stripped = _CAN_LINE_PREFIX.sub("", ln)
-            stripped = _STRAY_COLON.sub("", stripped)
+            m = _CAN_LINE_PREFIX.match(ln)
+            if m:
+                # CAN-numbered frame; accumulate.
+                stripped = ln[m.end():].replace(" ", "").replace("\t", "")
+                if _HEX_LINE.match(stripped):
+                    multi_run.append(stripped)
+                else:
+                    _flush_multi()
+                continue
+            # Non-prefixed line ends any multi-frame run.
+            _flush_multi()
+            stripped = _STRAY_COLON.sub("", ln).replace(" ", "").replace("\t", "")
             if _HEX_LINE.match(stripped):
-                run.append(stripped)
-            else:
-                # Non-hex line (echo, info banner, "SEARCHING...") breaks the
-                # current multi-frame run.
-                _flush()
-        _flush()
+                try:
+                    frames.append(bytes.fromhex(stripped))
+                except ValueError:
+                    pass
+            # Echo / banner / "SEARCHING..." lines are silently dropped.
+        _flush_multi()
         return ElmResponse(raw=text, frames=frames, ok=True)
 
     # ---------------- init ----------------
