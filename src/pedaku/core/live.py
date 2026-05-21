@@ -123,22 +123,37 @@ class LiveSampler:
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._thread = threading.Thread(target=self._run, name="elm-io", daemon=True)
+        self._started = False
 
     # ---------------- lifecycle ----------------
     def start(self) -> None:
+        # Guard against double-start: a Thread can only be started once, and
+        # calling start() twice on the same instance raises RuntimeError.
+        # DiagnosticSession creates a fresh LiveSampler per connect, but a
+        # caller that retries connect() on the same session should still get
+        # a clean no-op rather than a crash.
+        if self._started:
+            return
         now = time.monotonic()
         for p in self._pids:
             heapq.heappush(self._heap, (now, next(self._heap_counter), p))
         self._thread.start()
+        self._started = True
 
-    def stop(self, timeout: float = 2.0) -> None:
+    def stop(self, timeout: float = 3.0) -> None:
+        if not self._started:
+            return
         self._stop.set()
-        # Wake the worker if it's waiting on the job queue.
+        # Wake the worker if it's idle on the job queue. The sentinel runs as
+        # a no-op then the loop exits at the top because ``_stop`` is set.
         try:
             self._jobs.put_nowait(_Job(P_USER_HIGH, next(self._job_counter), lambda: None))
         except Exception:
             pass
         self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            log.warning("LiveSampler worker did not exit within %.1fs; "
+                        "the transport will be closed regardless.", timeout)
 
     def pause_sampling(self) -> None:
         """Stop background PID sampling without killing the worker."""
@@ -173,8 +188,13 @@ class LiveSampler:
                timeout: float = 5.0) -> Any:
         """Run *fn* on the I/O thread and return its result, or raise.
 
-        High-priority jobs jump ahead of background PID sampling.
+        High-priority jobs jump ahead of background PID sampling. Raises
+        ``RuntimeError`` if the worker has already been stopped (e.g. the
+        session is being torn down) so HTTP handlers fail fast instead of
+        blocking on a queue that will never drain.
         """
+        if self._stop.is_set() or not self._started:
+            raise RuntimeError("session not active")
         job = _Job(priority=priority, seq=next(self._job_counter), fn=fn)
         self._jobs.put(job)
         if not job.done.wait(timeout):

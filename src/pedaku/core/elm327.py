@@ -11,7 +11,17 @@ from .transport import Transport
 
 log = logging.getLogger(__name__)
 
-_HEX_LINE = re.compile(rb"^[0-9A-Fa-f \t]+$")
+# A line that is purely hex (with optional whitespace).
+_HEX_LINE = re.compile(r"^[0-9A-Fa-f][0-9A-Fa-f \t]*$")
+# Multi-frame CAN line numbering prefix that ELM327 prepends to each frame
+# of a long response (e.g. ``0:4902014743564B``, ``1:4D41364C39444A``).
+# It's a single hex digit + ``:`` at the start of the line. We strip it so
+# the surrounding hex parser can concatenate the frames into one payload.
+_CAN_LINE_PREFIX = re.compile(r"^[0-9A-Fa-f]:\s*")
+# KWP responses sometimes come back as ``HH HH : HH HH HH ...`` with a
+# colon between header and payload bytes. We don't use headers (ATH0), but
+# strip any stray colons just in case some clones leave them in.
+_STRAY_COLON = re.compile(r"\s*:\s*")
 
 
 @dataclass
@@ -53,19 +63,42 @@ class Elm327:
             "BUS ERROR", "CAN ERROR", "FB ERROR", "DATA ERROR",
             "UNABLE TO CONNECT", "BUFFER FULL", "ACT ALERT",
         }
-        bad = next((ln for ln in lines if ln.upper() in errors or ln.upper().startswith("UNABLE")), None)
+        bad = next(
+            (ln for ln in lines if ln.upper() in errors or ln.upper().startswith("UNABLE")),
+            None,
+        )
         if bad:
             return ElmResponse(raw=text, frames=[], ok=False, error=bad)
 
+        # Long ECU responses come back framed with a ``<idx>:<hex>`` prefix
+        # per line on CAN, and as multiple plain-hex lines on KWP/J1850.
+        # Concatenate any consecutive hex-only lines (CAN-prefixed or not)
+        # into a single decoded byte frame so downstream PID / DTC parsers
+        # see one contiguous payload.
         frames: list[bytes] = []
+        run: list[str] = []
+
+        def _flush() -> None:
+            if not run:
+                return
+            joined = "".join(run).replace(" ", "").replace("\t", "")
+            if joined:
+                try:
+                    frames.append(bytes.fromhex(joined))
+                except ValueError:
+                    pass
+            run.clear()
+
         for ln in lines:
-            # Skip echoes ("ATZ"), empty, or non-hex info lines
-            if not all(c in "0123456789ABCDEFabcdef \t" for c in ln):
-                continue
-            try:
-                frames.append(bytes.fromhex(ln.replace(" ", "")))
-            except ValueError:
-                continue
+            stripped = _CAN_LINE_PREFIX.sub("", ln)
+            stripped = _STRAY_COLON.sub("", stripped)
+            if _HEX_LINE.match(stripped):
+                run.append(stripped)
+            else:
+                # Non-hex line (echo, info banner, "SEARCHING...") breaks the
+                # current multi-frame run.
+                _flush()
+        _flush()
         return ElmResponse(raw=text, frames=frames, ok=True)
 
     # ---------------- init ----------------

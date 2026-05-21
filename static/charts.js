@@ -210,7 +210,7 @@
       for (let i = 0; i <= 6; i++) {
         const x = padL + (innerW * i) / 6;
         const ago = Math.round(sec - (sec * i) / 6);
-        ctx.fillText('-' + ago + 's', x, h - 6);
+        ctx.fillText(ago === 0 ? 'now' : '-' + ago + 's', x, h - 6);
       }
 
       const now = Date.now();
