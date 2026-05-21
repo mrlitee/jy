@@ -31,8 +31,14 @@ def decode_dtc_word(word: int) -> str:
 def parse_dtc_payload(frames: list[bytes], mode: str) -> list[str]:
     """Decode a Mode 03 / 07 / 0A response into DTC codes.
 
-    Each response begins with response-mode byte (e.g. 0x43 for Mode 03), then a
-    count byte (CAN) or directly the DTC word pairs (KWP). We tolerate both.
+    Each response begins with the response-mode byte (e.g. 0x43 for Mode 03).
+    On ISO 15765 (CAN) the next byte is the *count of DTCs*; ELM327 with
+    ``ATCAF1`` (default) leaves it in the payload. On KWP / J1850 some clones
+    omit the count byte and just emit the DTC pairs directly. We detect the
+    count byte robustly: only strip it when ``count * 2 + 1 == len(body)``,
+    i.e. the leading byte exactly accounts for the remaining bytes as DTC
+    pairs. This avoids the legacy heuristic's blind spot where a real DTC's
+    high byte (e.g. 0x01 for ``P0123``) happened to look like a count.
     """
     payload = b"".join(frames)
     resp_byte = (int(mode, 16) | 0x40).to_bytes(1, "big")
@@ -40,9 +46,7 @@ def parse_dtc_payload(frames: list[bytes], mode: str) -> list[str]:
     if idx < 0:
         return []
     body = payload[idx + 1:]
-    # Optional count byte for ISO 15765 (CAN). Heuristic: if first byte indicates
-    # a plausible count and remaining bytes are even, treat it as count.
-    if body and body[0] <= 0x20 and (len(body) - 1) % 2 == 0:
+    if body and body[0] * 2 + 1 == len(body):
         body = body[1:]
     codes: list[str] = []
     for i in range(0, len(body) - 1, 2):

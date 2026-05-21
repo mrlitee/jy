@@ -101,28 +101,40 @@ function activateTab(id) {
 }
 
 // ---------------- header status / health ----------------
-function setStatus(connected, info) {
-  state.connected = connected;
+function renderStatus() {
   const el = $('#status');
-  if (connected) {
-    const v = info.voltage !== null && info.voltage !== undefined
-      ? ' · ' + (+info.voltage).toFixed(2) + 'V' : '';
-    el.textContent = `connected · ${info.brand} · ${info.protocol || '?'}${v}`;
-    el.className = 'status online';
-  } else {
+  if (!state.connected) {
     el.textContent = 'offline';
     el.className = 'status offline';
+    return;
   }
+  const i = state.info || {};
+  const v = state.lastVoltage;
+  const voltStr = (typeof v === 'number' && isFinite(v))
+    ? ' \u00b7 ' + v.toFixed(2) + 'V'
+    : (i.voltage !== null && i.voltage !== undefined
+        ? ' \u00b7 ' + (+i.voltage).toFixed(2) + 'V' : '');
+  el.textContent =
+    `connected \u00b7 ${i.brand || '?'} \u00b7 ${i.protocol || '?'}${voltStr}`;
+  el.className = 'status online';
+}
+
+function setStatus(connected, info) {
+  state.connected = connected;
+  state.info = connected ? (info || {}) : null;
+  if (!connected) state.lastVoltage = null;
+  renderStatus();
 
   $('#info-card').hidden = !connected;
   if (connected) {
+    const i = state.info;
     $('#info-table').innerHTML = `
-      <tr><td>Brand</td><td>${info.brand || '-'}</td></tr>
-      <tr><td>Protocol</td><td>${info.protocol || '-'}</td></tr>
-      <tr><td>Adapter</td><td>${info.adapter || '-'}</td></tr>
-      <tr><td>Battery</td><td>${info.voltage !== null && info.voltage !== undefined ? (+info.voltage).toFixed(2) + ' V' : '-'}</td></tr>
-      <tr><td>VIN</td><td>${info.vin || '-'}</td></tr>
-      <tr><td>ECU</td><td>${info.ecu_name || '-'}</td></tr>`;
+      <tr><td>Brand</td><td>${i.brand || '-'}</td></tr>
+      <tr><td>Protocol</td><td>${i.protocol || '-'}</td></tr>
+      <tr><td>Adapter</td><td>${i.adapter || '-'}</td></tr>
+      <tr><td>Battery</td><td>${i.voltage !== null && i.voltage !== undefined ? (+i.voltage).toFixed(2) + ' V' : '-'}</td></tr>
+      <tr><td>VIN</td><td>${i.vin || '-'}</td></tr>
+      <tr><td>ECU</td><td>${i.ecu_name || '-'}</td></tr>`;
   }
 }
 
@@ -139,6 +151,8 @@ async function refreshHealth() {
 }
 
 // ---------------- SSE ----------------
+const STREAM_BACKOFF_MIN = 1500;     // ms
+const STREAM_BACKOFF_MAX = 15000;    // ms
 function openStream() {
   closeStream();
   const sse = new EventSource('/api/stream');
@@ -157,19 +171,31 @@ function openStream() {
       const s = JSON.parse(e.data);
       applySample(s);
     } catch (ex) { console.error(ex); }
+    // Successful message: reset backoff so a brief blip doesn't keep
+    // doubling the wait on subsequent reconnects.
+    state.streamBackoff = STREAM_BACKOFF_MIN;
   };
   sse.addEventListener('error', () => {
     $('#stream-dot').classList.remove('on');
     $('#stream-dot').classList.add('off');
-    if (state.connected) {
-      // Auto-reconnect after a short backoff.
-      setTimeout(() => { if (state.connected) openStream(); }, 1500);
-    }
+    if (!state.connected) return;
+    // Exponential backoff so a permanently broken server doesn't get
+    // hammered with reconnects (which the browser would otherwise retry
+    // every few hundred ms on its own anyway).
+    const wait = state.streamBackoff || STREAM_BACKOFF_MIN;
+    state.streamBackoff = Math.min(STREAM_BACKOFF_MAX, wait * 2);
+    if (state._streamRetry) clearTimeout(state._streamRetry);
+    state._streamRetry = setTimeout(() => {
+      state._streamRetry = null;
+      if (state.connected) openStream();
+    }, wait);
   });
   sse.addEventListener('end', () => closeStream());
 }
 function closeStream() {
   if (state.sse) { state.sse.close(); state.sse = null; }
+  if (state._streamRetry) { clearTimeout(state._streamRetry); state._streamRetry = null; }
+  state.streamBackoff = STREAM_BACKOFF_MIN;
   $('#stream-dot').classList.remove('on');
   $('#stream-dot').classList.add('off');
 }
@@ -194,14 +220,10 @@ function applySample(s) {
   if (state.mainChart && typeof v === 'number') {
     state.mainChart.push(code, t, v);
   }
-  // Header voltage live update
+  // Header voltage live update — driven from state, not text parsing.
   if (code === '42' && typeof v === 'number') {
-    const el = $('#status');
-    if (state.connected && el) {
-      const txt = el.textContent.split(' · ');
-      txt[3] = v.toFixed(2) + 'V';
-      el.textContent = txt.slice(0, 3).join(' · ') + ' · ' + v.toFixed(2) + 'V';
-    }
+    state.lastVoltage = v;
+    if (state.connected) renderStatus();
   }
   // Dyno update — recomputed on every RPM sample (the fastest sampled PID,
   // ~10 Hz), so the chart cursor and HP/Tq readouts move in real time.
@@ -421,7 +443,12 @@ const ADDRESS_PRESETS = {
 function applyKind(kind) {
   const preset = ADDRESS_PRESETS[kind] || ADDRESS_PRESETS.tcp;
   const addr = $('#f-address');
-  if (!addr.dataset.touched || addr.value === '') addr.value = preset.value;
+  // When the user switches kind we always swap to the preset for that kind:
+  // a TCP host:port is meaningless for a Bluetooth socket, and vice-versa.
+  // The previous logic kept whatever the user had typed even after the kind
+  // changed, which produced confusing "connect failed" errors.
+  addr.value = preset.value;
+  delete addr.dataset.touched;
   addr.placeholder = preset.placeholder;
   addr.disabled = false;
   $('#bt-controls').hidden = (kind !== 'bluetooth');
