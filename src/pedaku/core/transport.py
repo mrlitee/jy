@@ -269,13 +269,20 @@ def discover_bluetooth_devices(timeout: float = 4.0) -> list[PortInfo]:
             continue
         for line in res.stdout.splitlines():
             # Expected format: "Device AA:BB:CC:DD:EE:FF Friendly Name"
+            # Some bluetoothctl builds also print bracketed tags such as
+            # "[default]" or "[trusted]" mixed into the name field; strip
+            # those so the UI dropdown shows the actual device name.
             parts = line.strip().split(" ", 2)
             if len(parts) >= 2 and parts[0] == "Device" and _is_valid_mac(parts[1]):
                 mac = parts[1].upper()
                 if mac in seen:
                     continue
                 seen.add(mac)
-                name = parts[2] if len(parts) > 2 else ""
+                raw_name = parts[2] if len(parts) > 2 else ""
+                name = " ".join(
+                    tok for tok in raw_name.split()
+                    if not (tok.startswith("[") and tok.endswith("]"))
+                ).strip()
                 out.append(PortInfo("bluetooth", mac, name))
         if out:
             break  # got results from "Paired", no need to fall back
