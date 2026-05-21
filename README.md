@@ -12,6 +12,7 @@ Backend: Python + Flask. Frontend: vanilla HTML/CSS/JS — tanpa framework, tanp
 - **Real-time streaming via Server-Sent Events** — UI update mengikuti data ECU, bukan polling timer (no delay)
 - **Adaptive sampler**: RPM/TPS @ 10 Hz, MAP/Speed @ 5 Hz, suhu/baro @ 0.2–1 Hz
 - **Priority I/O queue**: klik DTC scan / actuator test mendahului sampling, respons instan
+- **Auto-recover dari koneksi putus**: TCP keepalive + retry 1× per command + watchdog 25 sample fail → flip offline; UI auto-reconnect SSE 2 detik dan reconcile state tiap 5 detik
 - Auto-protocol detection (ISO 9141, KWP2000, ISO 15765 CAN)
 - 15 PID live (RPM, TPS, MAP, ECT, IAT, O2, lambda, fuel trim, dll.)
 - **Live Chart** multi-series dengan window 15s/60s/3m/10m, hover tooltip — tanpa CDN/Chart.js
@@ -134,6 +135,19 @@ pedaku/
 ## Disclaimer
 
 Live test mengaktifkan aktuator nyata. Lakukan dengan motor diam, dudukan stabil. Tegangan aki ≥11V. Beberapa ELM327 clone tidak reliable di KWP2000.
+
+## Anti-disconnect (kenapa lebih jarang putus dibanding dulu)
+
+Adapter ELM327 — terutama varian WiFi/Bluetooth murah — gampang "diam" di tengah sesi: WiFi tidur, baterai lemah, frame OBD korup. Pedaku menangani ini di tiga lapis:
+
+| Lapis | Yang dilakukan | Efek yang terlihat user |
+|---|---|---|
+| Transport | TCP `SO_KEEPALIVE` + `TCP_NODELAY`, drain buffer sebelum tiap command, deteksi peer-FIN | Koneksi mati ditangkap dalam ~30 detik, bukan 2 jam default OS |
+| Driver ELM327 | Retry 1× otomatis (close + reopen) saat satu command gagal di transport, `ATZ` tunggu prompt asli, bukan `sleep(0.4)` | Satu paket korup tidak menjatuhkan sesi; clone lambat tetap booting bersih |
+| Sampler/Session | Watchdog 25 sample gagal berturut-turut → flip offline + isi `last_error`; heartbeat `ATRV` tiap 30 detik | Tab yang tidak streaming PID pun tetap mendeteksi link mati |
+| SSE / UI | `retry: 2000` ke browser, keepalive 5 detik, `event: end` membawa alasan disconnect, `/api/state` di-poll tiap 5 detik untuk reconcile | EventSource auto-reconnect dalam 2 detik tanpa reconnect-storm; UI menampilkan alasan offline |
+
+Hasilnya: blip 1–2 detik di WiFi tidak menjatuhkan sesi, dan koneksi yang benar-benar mati ditandai jelas di status pill (warna amber → reconnecting, merah → offline + alasan).
 
 ## Lisensi
 

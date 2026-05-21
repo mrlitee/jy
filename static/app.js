@@ -10,6 +10,20 @@
 //   - DTC scan / clear / freeze frame / report PDF / actuator tests all
 //     submit a high-priority job to the I/O worker; they pre-empt the
 //     next PID sample so the user never waits for a polling cycle.
+//
+// Resilience model:
+//   - The server emits `retry: 2000` on every SSE response, so the
+//     browser's built-in EventSource auto-reconnect kicks in 2s after a
+//     network blip. We trust that and DO NOT add our own setTimeout
+//     reconnect on top - the previous version did, which produced
+//     reconnect storms (browser + JS racing each other).
+//   - A 5s /api/state poll reconciles the UI with the server's notion of
+//     "connected". If the watchdog on the server has just declared the
+//     link dead, we mark the UI offline without the user clicking
+//     anything; conversely if the server says we're connected but our
+//     EventSource is in CLOSED state, we reopen it.
+//   - All API helpers retry a couple of times on transient network errors
+//     so a single dropped packet doesn't surface as an "alert()".
 
 const $  = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
@@ -33,14 +47,22 @@ const PIDS = [
 ];
 const PID_META = Object.fromEntries(PIDS.map(([c, n, u, col]) => [c, { name: n, unit: u, color: col }]));
 
+// State-reconcile interval. Picked so a watchdog-triggered server-side
+// disconnect surfaces in the UI within 5s without spamming /api/state.
+const RECONCILE_INTERVAL_MS = 5000;
+const HEALTH_INTERVAL_MS    = 5000;
+
 const state = {
-  connected: false,
+  connected: false,         // OUR view of the connection. Reconciled with /api/state.
+  streamOpen: false,        // SSE readyState === OPEN
+  lastEnd: null,            // {reason} from the most recent server-sent end event
   sse: null,
   sparklines: {},   // code -> Sparkline
   mainChart: null,
   selectedSeries: new Set(['0C', '11', '0B', '05']),
   lastValues: {},   // code -> last numeric value (for gauges)
   healthTimer: null,
+  reconcileTimer: null,
   dyno: {
     chart: null,
     recording: false,    // pushes samples to the active run when true
@@ -51,14 +73,34 @@ const state = {
 };
 
 // ---------------- helpers ----------------
-async function api(method, path, body) {
+async function api(method, path, body, { retries = 1, retryDelay = 400 } = {}) {
+  // Tiny retry layer for transient network blips. We do NOT retry on a
+  // 4xx/5xx response - that's a deliberate server-side rejection that the
+  // user needs to see. Only network-level errors (TypeError from fetch)
+  // and a couple of "service-temporarily-unavailable" status codes are
+  // retried, so a flaky WiFi link doesn't surface as an "alert()".
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(path, opts);
-  let data = null;
-  try { data = await r.json(); } catch (e) { /* ignore */ }
-  if (!r.ok) throw new Error((data && data.error) || `HTTP ${r.status}`);
-  return data;
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(path, opts);
+      let data = null;
+      try { data = await r.json(); } catch (_) { /* ignore */ }
+      if (r.ok) return data;
+      // Don't retry on 4xx — that's the user's responsibility to fix.
+      if (r.status < 500 && r.status !== 503) {
+        throw new Error((data && data.error) || `HTTP ${r.status}`);
+      }
+      lastErr = new Error((data && data.error) || `HTTP ${r.status}`);
+    } catch (ex) {
+      lastErr = ex;
+    }
+    if (attempt < retries) {
+      await new Promise(r => setTimeout(r, retryDelay));
+    }
+  }
+  throw lastErr || new Error('request failed');
 }
 
 function fmtVal(code, v) {
@@ -89,22 +131,29 @@ function activateTab(id) {
         codes: ['0C', '0B', '04', '11'], period_ms: 100,
       }).catch(() => {});
     }
-  } else {
-    // Restore default per-PID rates when leaving the dyno tab to avoid
-    // hammering the ECU with rarely-used readings.
-    if (state.connected && state.dynoFocusActive) {
-      api('POST', '/api/sampler/focus', { codes: [] }).catch(() => {});
-      state.dynoFocusActive = false;
-    }
+    state.dynoFocusActive = true;
+    return;
   }
-  state.dynoFocusActive = (id === 'dyno');
+  // Restore default per-PID rates when leaving the dyno tab to avoid
+  // hammering the ECU with rarely-used readings.
+  if (state.connected && state.dynoFocusActive) {
+    api('POST', '/api/sampler/focus', { codes: [] }).catch(() => {});
+  }
+  state.dynoFocusActive = false;
 }
 
 // ---------------- header status / health ----------------
 function renderStatus() {
   const el = $('#status');
   if (!state.connected) {
-    el.textContent = 'offline';
+    // Surface the watchdog reason if the server told us why we dropped.
+    // Helpful when the user's screen is awake but the WiFi to the adapter
+    // has just gone idle - the message tells them to wake the bike up.
+    if (state.lastEnd && state.lastEnd.reason) {
+      el.textContent = `offline · ${state.lastEnd.reason}`;
+    } else {
+      el.textContent = 'offline';
+    }
     el.className = 'status offline';
     return;
   }
@@ -114,15 +163,22 @@ function renderStatus() {
     ? ' \u00b7 ' + v.toFixed(2) + 'V'
     : (i.voltage !== null && i.voltage !== undefined
         ? ' \u00b7 ' + (+i.voltage).toFixed(2) + 'V' : '');
+  const streamMark = state.streamOpen ? '' : ' \u00b7 reconnecting…';
   el.textContent =
-    `connected \u00b7 ${i.brand || '?'} \u00b7 ${i.protocol || '?'}${voltStr}`;
-  el.className = 'status online';
+    `connected \u00b7 ${i.brand || '?'} \u00b7 ${i.protocol || '?'}${voltStr}${streamMark}`;
+  el.className = state.streamOpen ? 'status online' : 'status warn';
 }
 
 function setStatus(connected, info) {
   state.connected = connected;
   state.info = connected ? (info || {}) : null;
-  if (!connected) state.lastVoltage = null;
+  if (!connected) {
+    state.lastVoltage = null;
+    state.streamOpen = false;
+  } else {
+    // Successful (re)connect clears any stale offline reason.
+    state.lastEnd = null;
+  }
   renderStatus();
 
   $('#info-card').hidden = !connected;
@@ -167,14 +223,29 @@ async function refreshHealth() {
 }
 
 // ---------------- SSE ----------------
-const STREAM_BACKOFF_MIN = 1500;     // ms
-const STREAM_BACKOFF_MAX = 15000;    // ms
+//
+// EventSource has built-in auto-reconnect that honours the server's
+// `retry: <ms>` hint. Our server sets it to 2000 ms. We DO NOT add a
+// JS-level setTimeout reconnect on top - the previous version did, which
+// produced two parallel retry attempts every time. The browser handles
+// the loop; we just track readyState in the UI.
 function openStream() {
   closeStream();
-  const sse = new EventSource('/api/stream');
+  let sse;
+  try {
+    sse = new EventSource('/api/stream');
+  } catch (ex) {
+    console.error('EventSource ctor failed', ex);
+    return;
+  }
   state.sse = sse;
-  $('#stream-dot').classList.remove('off');
-  $('#stream-dot').classList.add('on');
+  setStreamDot(false); // we are CONNECTING, not OPEN
+
+  sse.addEventListener('open', () => {
+    state.streamOpen = true;
+    setStreamDot(true);
+    renderStatus();
+  });
 
   sse.addEventListener('snapshot', (e) => {
     try {
@@ -182,38 +253,63 @@ function openStream() {
       Object.values(snap).forEach(s => applySample(s));
     } catch (ex) { console.error(ex); }
   });
+
   sse.onmessage = (e) => {
     try {
       const s = JSON.parse(e.data);
       applySample(s);
     } catch (ex) { console.error(ex); }
-    // Successful message: reset backoff so a brief blip doesn't keep
-    // doubling the wait on subsequent reconnects.
-    state.streamBackoff = STREAM_BACKOFF_MIN;
   };
-  sse.addEventListener('error', () => {
-    $('#stream-dot').classList.remove('on');
-    $('#stream-dot').classList.add('off');
-    if (!state.connected) return;
-    // Exponential backoff so a permanently broken server doesn't get
-    // hammered with reconnects (which the browser would otherwise retry
-    // every few hundred ms on its own anyway).
-    const wait = state.streamBackoff || STREAM_BACKOFF_MIN;
-    state.streamBackoff = Math.min(STREAM_BACKOFF_MAX, wait * 2);
-    if (state._streamRetry) clearTimeout(state._streamRetry);
-    state._streamRetry = setTimeout(() => {
-      state._streamRetry = null;
-      if (state.connected) openStream();
-    }, wait);
+
+  sse.addEventListener('error', (e) => {
+    state.streamOpen = false;
+    setStreamDot(false);
+    // If the server emitted a named `error` event with a JSON payload
+    // (e.g. "not connected"), capture it for the status pill. Plain
+    // network errors come with no data attribute and are not actionable
+    // beyond letting EventSource auto-retry.
+    if (e && typeof e.data === 'string' && e.data) {
+      try {
+        const p = JSON.parse(e.data);
+        if (p && p.error) state.lastEnd = { reason: p.error };
+      } catch (_) {}
+    }
+    // Don't manually re-open here. EventSource will move to CONNECTING and
+    // try again automatically after the server-set retry interval. We just
+    // surface the "reconnecting" state in the status pill.
+    renderStatus();
   });
-  sse.addEventListener('end', () => closeStream());
+
+  // Server explicitly tells us "this stream is over" when the session is
+  // torn down (user clicked Disconnect, or watchdog tripped). We must
+  // close() in that case - otherwise EventSource would keep reconnecting
+  // and re-getting the same end event in a loop.
+  sse.addEventListener('end', (e) => {
+    let reason = '';
+    try { reason = (JSON.parse(e.data) || {}).reason || ''; } catch (_) {}
+    state.lastEnd = { reason };
+    closeStream();
+    // Reconcile immediately so the UI flips offline without waiting for
+    // the next 5s poll.
+    setStatus(false, {});
+    if (state.healthTimer) { clearInterval(state.healthTimer); state.healthTimer = null; }
+  });
 }
+
 function closeStream() {
-  if (state.sse) { state.sse.close(); state.sse = null; }
-  if (state._streamRetry) { clearTimeout(state._streamRetry); state._streamRetry = null; }
-  state.streamBackoff = STREAM_BACKOFF_MIN;
-  $('#stream-dot').classList.remove('on');
-  $('#stream-dot').classList.add('off');
+  if (state.sse) {
+    try { state.sse.close(); } catch (_) {}
+    state.sse = null;
+  }
+  state.streamOpen = false;
+  setStreamDot(false);
+}
+
+function setStreamDot(on) {
+  const dot = $('#stream-dot');
+  if (!dot) return;
+  dot.classList.toggle('on', !!on);
+  dot.classList.toggle('off', !on);
 }
 
 function applySample(s) {
@@ -465,12 +561,19 @@ const ADDRESS_PRESETS = {
 function applyKind(kind) {
   const preset = ADDRESS_PRESETS[kind] || ADDRESS_PRESETS.tcp;
   const addr = $('#f-address');
-  // When the user switches kind we always swap to the preset for that kind:
-  // a TCP host:port is meaningless for a Bluetooth socket, and vice-versa.
-  // The previous logic kept whatever the user had typed even after the kind
-  // changed, which produced confusing "connect failed" errors.
-  addr.value = preset.value;
-  delete addr.dataset.touched;
+  // Only swap to the preset when:
+  //  (a) the field is empty, or
+  //  (b) the user hasn't manually edited the field this session AND the
+  //      current value is the preset for ANY known kind (so a leftover
+  //      tcp host:port doesn't follow you into Bluetooth mode).
+  // This preserves a manually-typed address across kind changes - the old
+  // logic clobbered it on every change, which was confusing once a user
+  // had pasted a MAC.
+  const isStalePreset = Object.values(ADDRESS_PRESETS).some(p => p.value && p.value === addr.value);
+  if (!addr.dataset.touched || addr.value === '' || isStalePreset) {
+    addr.value = preset.value;
+    delete addr.dataset.touched;
+  }
   addr.placeholder = preset.placeholder;
   addr.disabled = false;
   $('#bt-controls').hidden = (kind !== 'bluetooth');
@@ -526,6 +629,8 @@ function setupConnect() {
     };
     setStatus(false, {});
     $('#status').textContent = 'connecting…';
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
     try {
       const res = await api('POST', '/api/connect', body);
       setStatus(true, res.info);
@@ -534,6 +639,8 @@ function setupConnect() {
     } catch (ex) {
       alert(`Connect failed: ${ex.message}`);
       setStatus(false, {});
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
     }
   });
 
@@ -542,6 +649,8 @@ function setupConnect() {
     if (state.healthTimer) { clearInterval(state.healthTimer); state.healthTimer = null; }
     try { await api('POST', '/api/disconnect'); } catch (e) { /* ignore */ }
     setStatus(false, {});
+    state.lastEnd = null;       // a user-driven disconnect is not an error
+    renderStatus();
     // Reset dyno so a new bike doesn't inherit old peaks/calibration.
     if (state.dyno.chart) {
       state.dyno.chart.reset();
@@ -567,7 +676,7 @@ function onConnected() {
   seedHistory().catch(() => {});
   refreshHealth();
   if (state.healthTimer) clearInterval(state.healthTimer);
-  state.healthTimer = setInterval(refreshHealth, 5000);
+  state.healthTimer = setInterval(refreshHealth, HEALTH_INTERVAL_MS);
 }
 
 async function seedHistory() {
@@ -602,6 +711,47 @@ async function seedHistory() {
       }
     }
   });
+}
+
+// ---------------- state reconcile ----------------
+//
+// A 5s poll that compares our notion of "connected" against the server's.
+// Three transitions matter:
+//
+//  - server-disconnected, ui-connected  -> watchdog tripped while we were
+//    looking at a tab that wasn't streaming. Flip UI offline immediately.
+//  - server-connected,    ui-disconnected -> some other browser tab (or a
+//    refresh in flight) brought the session back up. Re-attach.
+//  - server-connected,    ui-connected, sse-closed -> our SSE failed to
+//    auto-reconnect (e.g. the browser saw a `event: end` and stopped). Re-
+//    open it manually.
+async function reconcileState() {
+  let s;
+  try {
+    s = await api('GET', '/api/state', null, { retries: 0 });
+  } catch (_) {
+    return; // server itself unreachable; let the next tick try again
+  }
+  const serverConnected = !!(s && s.connected);
+  if (serverConnected && !state.connected) {
+    // Adopt the existing session (typical after a page reload).
+    setStatus(true, s);
+    onConnected();
+    return;
+  }
+  if (!serverConnected && state.connected) {
+    if (s && s.last_error) state.lastEnd = { reason: s.last_error };
+    closeStream();
+    if (state.healthTimer) { clearInterval(state.healthTimer); state.healthTimer = null; }
+    setStatus(false, s || {});
+    return;
+  }
+  if (serverConnected && state.connected) {
+    // Re-open the stream if it died and the browser couldn't recover it.
+    if (!state.sse || state.sse.readyState === 2 /* CLOSED */) {
+      openStream();
+    }
+  }
 }
 
 // ---------------- DTC ----------------
@@ -753,8 +903,30 @@ async function init() {
       onConnected();
     } else {
       applyReportAvailability(s && s.report_available);
+      // Surface a stale offline reason from a previous session.
+      if (s && s.last_error) {
+        state.lastEnd = { reason: s.last_error };
+        renderStatus();
+      }
     }
   } catch (e) { /* ignore */ }
+
+  // Start the periodic reconcile loop. Runs forever; `state.connected`
+  // is the source of truth for whether to attempt SSE reopen.
+  state.reconcileTimer = setInterval(reconcileState, RECONCILE_INTERVAL_MS);
+
+  // When the tab is hidden the browser may suspend timers / SSE. On
+  // visibility-change re-run reconcileState immediately so the user sees
+  // fresh data the moment they switch back to the tab.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) reconcileState();
+  });
+  window.addEventListener('online',  reconcileState);
+  window.addEventListener('offline', () => {
+    state.streamOpen = false;
+    setStreamDot(false);
+    renderStatus();
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);

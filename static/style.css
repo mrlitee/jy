@@ -39,6 +39,9 @@ header .sub { color: var(--ink-2); font-weight: 400; font-size: 13px; margin-lef
 }
 .status.online { color: var(--ok); border-color: var(--ok); }
 .status.offline { color: var(--bad); border-color: var(--bad); }
+/* "warn" = connected but stream is reconnecting after a blip. The amber
+   pill makes it obvious without scaring the user with a hard "offline". */
+.status.warn { color: var(--warn); border-color: var(--warn); }
 
 .health-pill, .stream-pill {
   display: inline-flex; align-items: center; gap: 6px;

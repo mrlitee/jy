@@ -314,5 +314,151 @@ class IntegrationTest(unittest.TestCase):
         self.assertIsInstance(server._report_available(), bool)
 
 
+
+# --------------------------------------------------------------------------- #
+# Resilience tests                                                            #
+# --------------------------------------------------------------------------- #
+class FlakyTransport(FakeElm327Transport):
+    """Same as FakeElm327Transport but the next ``failures`` reads raise.
+
+    Used to verify that :meth:`Elm327._command` recovers a single bad
+    packet via reopen-and-retry instead of bubbling up an OSError.
+    """
+
+    def __init__(self, fail_first: int = 1) -> None:
+        super().__init__()
+        self._remaining_failures = int(fail_first)
+        self.reopen_count = 0
+
+    def open(self) -> None:
+        # The driver calls open() during the retry path; bump a counter so
+        # the test can assert we actually went through reopen + retry.
+        if not self._open:
+            self.reopen_count += 1
+        super().open()
+
+    def write(self, data: bytes) -> None:
+        from pedaku.core.transport import TransportError
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            self._open = False
+            raise TransportError("simulated link blip")
+        super().write(data)
+
+
+class ResilienceTest(unittest.TestCase):
+    """Exercises the disconnect / recovery paths added on top of the
+    happy-path :class:`IntegrationTest`."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # These tests deliberately drive the engine into failure modes
+        # (link dead, init refused). Silencing the noisy WARNING logs they
+        # produce keeps CI output readable - real users still see the logs
+        # because run_web.py defaults to INFO level.
+        import logging
+        cls._restore_levels: list[tuple[logging.Logger, int]] = []
+        for name in ("pedaku.core.elm327", "pedaku.core.live", "pedaku.core.session"):
+            log = logging.getLogger(name)
+            cls._restore_levels.append((log, log.level))
+            log.setLevel(logging.ERROR)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for log, level in cls._restore_levels:
+            log.setLevel(level)
+
+    def test_command_recovers_from_single_transport_blip(self) -> None:
+        """A one-shot TransportError should NOT propagate to the caller.
+
+        The ELM327 driver reopens the transport and replays the command;
+        the second attempt sees the FakeTransport's normal canned reply.
+        """
+        from pedaku.core.elm327 import Elm327
+        t = FlakyTransport(fail_first=1)
+        t.open()
+        elm = Elm327(t)
+        r = elm.request("ATRV", timeout=1.0)
+        self.assertTrue(r.ok, f"reopen+retry should have recovered, got {r.error!r}")
+        self.assertIn("12.34", r.raw)
+        # Reopen counter went up: 1 from initial open(), +1 from recovery.
+        self.assertGreaterEqual(t.reopen_count, 2)
+        # Streak counter cleared after the eventual success so a future
+        # one-shot blip doesn't get conflated with the previous recovery.
+        self.assertEqual(elm.failure_streak, 0)
+
+    def test_persistent_transport_failure_marks_session_dead(self) -> None:
+        """A flood of consecutive failures should trip the watchdog and
+        flip the session's ``connected`` flag to False without anyone
+        having to call ``disconnect()`` explicitly."""
+        from pedaku.core.transport import TransportError
+
+        class DeadTransport(FakeElm327Transport):
+            def write(self, data: bytes) -> None:  # noqa: D401
+                raise TransportError("dead link")
+
+            def read_until(self, terminator: bytes = b">", timeout: float = 2.0) -> bytes:
+                raise TransportError("dead link")
+
+        sess = DiagnosticSession(transport=DeadTransport(), brand="Generic OBD-II")
+        # Speed up the watchdog so the test stays under a second.
+        sess.live.DEAD_AFTER_FAILURES = 3
+        # Bypass the real connect() (which would itself fail) and start the
+        # sampler manually with the broken transport.
+        sess._connected = True
+        sess.live.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and sess.connected:
+                time.sleep(0.05)
+            self.assertFalse(sess.connected,
+                             "watchdog should have flipped session offline")
+            self.assertTrue(sess.last_error,
+                            f"last_error should be populated, got {sess.last_error!r}")
+        finally:
+            sess.live.stop()
+
+    def test_failed_connect_records_last_error(self) -> None:
+        """When initialize() fails, ``DiagnosticSession.last_error`` carries
+        the human-readable reason instead of a generic boolean False."""
+        class RefusingTransport(FakeElm327Transport):
+            # Returns "?" to every command, so initialize() loops through
+            # all retries and bails. The driver still treats this as a
+            # transport-alive condition, so the only signal is via
+            # ``last_error``.
+            def _respond(self, cmd: str) -> bytes:
+                if cmd == "ATZ":
+                    return b"\rELM327 v1.5\r\r>"
+                if cmd == "ATSP0":
+                    return b"?\r>"
+                return b"?\r>"
+
+        sess = DiagnosticSession(transport=RefusingTransport(), brand="Generic OBD-II")
+        sess.CONNECT_RETRIES = 0
+        ok = sess.connect()
+        self.assertFalse(ok)
+        self.assertTrue(sess.last_error)
+        self.assertFalse(sess.connected)
+        sess.disconnect()
+
+    def test_submit_fails_fast_after_stop(self) -> None:
+        """submit() must raise immediately once the worker is stopped so
+        HTTP handlers don't hang on a queue that will never drain."""
+        from pedaku.core.live import LiveSampler, P_USER_HIGH
+        from pedaku.core.obd_pid import all_live_pids
+
+        def _request(_cmd: str, _timeout: float) -> Any:
+            class R: ok = True; raw = ""; frames: list[bytes] = []
+            return R()
+
+        sampler = LiveSampler(request_fn=_request, pids=all_live_pids())
+        sampler.start()
+        sampler.stop(timeout=1.0)
+        with self.assertRaises(RuntimeError):
+            sampler.submit(lambda: 42, priority=P_USER_HIGH, timeout=0.5)
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
